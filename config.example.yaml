@@ -1,0 +1,33 @@
+event:
+  url: "https://ticketplus.com.tw/order/a56fce0af2da4d41e26b2dfa34b7babc/debf14611c86559f4c28d8005b063ccf"
+  # 開賣時間 (ISO 8601 with timezone)
+  sale_time: "2026-06-01T12:00:00+08:00"
+
+preferences:
+  ticket_count: 1
+  # 若活動頁顯示多場次（不同日期），可指定要點哪一場
+  # 例如 "5/31" 或 "5/30"；不填則點第一個可用場次
+  session_keyword: null
+  # 票區優先序：依優先序排列，第一個有票就買
+  # 名稱要對應頁面上顯示的票區文字（部分比對即可）
+  zone_priority:
+    - "搖滾"        # 5880
+    - "4880"
+    - "3880"
+    - "2880"
+  seat_allocation: "電腦選位"   # 或 "自行選位"
+  pickup: "ibon"                # 取票方式
+  payment: "信用卡"             # "信用卡" 或 "ATM"
+
+  # 實名制活動需要每張票一份參加者資訊；非實名制活動可留空陣列
+  # 數量必須 >= ticket_count
+  participants:
+    - name: "王小明"
+      id_number: "A123456789"      # 身分證或護照
+      nationality: "Taiwan"         # 國籍/地區（autocomplete 會用此字串選下拉選項）
+
+state:
+  storage_state_path: "state/storage_state.json"
+
+# 開賣前幾秒進入訂購頁
+lead_seconds: 3
