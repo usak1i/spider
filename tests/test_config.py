@@ -63,8 +63,20 @@ def test_invalid_sale_time_raises(tmp_path):
         config.load(_write(tmp_path, body))
 
 
-def test_ticket_count_must_be_one(tmp_path):
+def test_ticket_count_2_is_allowed(tmp_path):
     body = VALID.replace("ticket_count: 1", "ticket_count: 2")
+    cfg = config.load(_write(tmp_path, body))
+    assert cfg.preferences.ticket_count == 2
+
+
+def test_ticket_count_zero_raises(tmp_path):
+    body = VALID.replace("ticket_count: 1", "ticket_count: 0")
+    with pytest.raises(config.ConfigError, match="ticket_count"):
+        config.load(_write(tmp_path, body))
+
+
+def test_ticket_count_too_large_raises(tmp_path):
+    body = VALID.replace("ticket_count: 1", "ticket_count: 20")
     with pytest.raises(config.ConfigError, match="ticket_count"):
         config.load(_write(tmp_path, body))
 
@@ -164,13 +176,18 @@ def test_participants_count_lt_tickets_raises(tmp_path):
     - name: "Foo"
       id_number: "A1"
 """)
-    # ticket_count=2 但 participants=1：但 ticket_count != 1 也會先觸發其他驗證
-    # 改測 ticket_count=1，participants=2 是允許的（不會 raise）
-    body2 = _with_participants(VALID, """  participants:
+    with pytest.raises(config.ConfigError, match="participants"):
+        config.load(_write(tmp_path, body))
+
+
+def test_participants_count_ge_tickets_is_ok(tmp_path):
+    body = VALID.replace("ticket_count: 1", "ticket_count: 2")
+    body = _with_participants(body, """  participants:
     - name: "Foo"
       id_number: "A1"
     - name: "Bar"
       id_number: "B2"
 """)
-    cfg = config.load(_write(tmp_path, body2))
+    cfg = config.load(_write(tmp_path, body))
+    assert cfg.preferences.ticket_count == 2
     assert len(cfg.preferences.participants) == 2

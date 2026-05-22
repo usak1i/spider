@@ -89,8 +89,13 @@ def load(path: str | Path) -> Config:
     )
 
     ticket_count = _require(preferences_raw, "ticket_count", "preferences")
-    if ticket_count != 1:
-        raise ConfigError("目前只支援 ticket_count = 1")
+    if not isinstance(ticket_count, int) or ticket_count < 1:
+        raise ConfigError("preferences.ticket_count 必須是 >= 1 的整數")
+    if ticket_count > 6:
+        raise ConfigError(
+            f"preferences.ticket_count={ticket_count} 似乎太大；"
+            "ticketplus 通常每帳號最多 4-6 張，請確認"
+        )
 
     zone_priority = _require(preferences_raw, "zone_priority", "preferences")
     if not isinstance(zone_priority, list) or not zone_priority:

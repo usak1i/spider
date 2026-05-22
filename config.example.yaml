@@ -4,7 +4,7 @@ event:
   sale_time: "2026-06-01T12:00:00+08:00"
 
 preferences:
-  ticket_count: 1
+  ticket_count: 1                # 1-6，實名制活動需 participants 數量 >= 此值
   # 若活動頁顯示多場次（不同日期），可指定要點哪一場
   # 例如 "5/31" 或 "5/30"；不填則點第一個可用場次
   session_keyword: null

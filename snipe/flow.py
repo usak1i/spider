@@ -127,20 +127,25 @@ def click_buy_now_until_modal(
     page: Page,
     session_keyword: str | None = None,
     max_seconds: float = 30.0,
+    refresh_interval: float = 1.5,
 ) -> None:
-    """高頻點擊「立即購買」按鈕直到票區選擇頁出現。
+    """高頻嘗試進入票區選擇頁。
 
-    偵測票區頁的條件（任一命中即視為已進入）：
-    - 文字「選擇票種」或「選擇票區」可見
-    - 出現 .v-expansion-panel-header（正式場次的票區清單）
-    - 出現含「剩餘」字樣的 .v-card
+    策略：
+    1. 每 100ms 偵測票區頁是否已出現
+    2. 若有「立即購買」button 且 enabled，立刻點擊
+    3. 若距離上次重整超過 refresh_interval 秒仍沒進展，page.reload() 重新拉頁面
+       —— 部分售票系統開賣後需要重整頁面才會載入訂購流程
     """
     if session_keyword:
-        log.info("嘗試點擊「立即購買」（場次關鍵字: %s）", session_keyword)
+        log.info("嘗試進入訂購頁（場次關鍵字: %s，refresh 每 %.1fs）",
+                 session_keyword, refresh_interval)
     else:
-        log.info("嘗試點擊「立即購買」（第一個可用場次）")
+        log.info("嘗試進入訂購頁（第一個可用場次，refresh 每 %.1fs）", refresh_interval)
 
     deadline = time.time() + max_seconds
+    last_action_ts = time.time()  # 最近一次點擊或剛 reload 完的時間
+
     while time.time() < deadline:
         marker = _on_zone_page(page)
         if marker:
@@ -148,12 +153,27 @@ def click_buy_now_until_modal(
             return
 
         btn = _buy_now_button_locator(page, session_keyword)
+        clicked = False
         if btn is not None:
             try:
                 if btn.is_visible(timeout=100) and btn.is_enabled(timeout=100):
                     btn.click(timeout=500, no_wait_after=True)
+                    clicked = True
+                    last_action_ts = time.time()
             except Exception:
                 pass
+
+        # 若超過 refresh_interval 秒都沒進展（沒有點到、也沒進票區頁），就重整頁面
+        if not clicked and (time.time() - last_action_ts) > refresh_interval:
+            try:
+                log.info("重整頁面（已等 %.1fs 無進展）", time.time() - last_action_ts)
+                page.reload(wait_until="domcontentloaded", timeout=8000)
+                last_action_ts = time.time()
+                page.wait_for_timeout(150)  # 讓 SPA 初步 mount
+            except Exception as e:
+                log.warning("reload 失敗: %s", e)
+                last_action_ts = time.time()
+
         time.sleep(0.1)
 
     _screenshot(page, "buy-now-timeout")
@@ -191,100 +211,190 @@ def _norm(s: str) -> str:
     return _WS_OR_COMMA_RE.sub("", s)
 
 
-def _try_select_via_expansion(page: Page, keyword: str, count: int) -> bool:
-    """嘗試 expansion panel 模式：點 header 展開後在 panel content 內按 +。
+def _set_count_via_plus(scope, page: Page, count: int, label: str) -> bool:
+    """在 scope 範圍內按 + 按鈕 count 次。若找不到，回傳 False。"""
+    plus_btn = scope.locator(_PLUS_SELECTOR).first
+    if plus_btn.count() == 0:
+        # FAB 風格 fallback
+        fab = scope.locator(".v-btn--fab, button.v-btn")
+        try:
+            nfb = fab.count()
+        except Exception:
+            nfb = 0
+        if nfb >= 2:
+            plus_btn = fab.nth(nfb - 1)
+        elif nfb == 1:
+            plus_btn = fab.first
+        else:
+            return False
+    try:
+        for _ in range(count):
+            plus_btn.click(timeout=1500)
+            page.wait_for_timeout(60)
+        return True
+    except Exception as e:
+        log.warning("  - %r 點 + 失敗: %s", label, e)
+        return False
 
-    用 normalized text 比對（去逗號），讓 "3200" 也能命中 "NT.3,200"。
+
+def _try_select_via_expansion(page: Page, keyword: str, count: int) -> bool:
+    """expansion panel 模式 — 支援兩層結構：
+
+    - 一層（測試場次）：header 含 keyword（如 "500"）→ 展開後內含 +/- stepper
+    - 兩層（正式場次）：header 是價格分類（如 "5880 區"），content 內是具體 row
+      （如 "搖滾A區"）；keyword 比對 content row 後點擊該 row，再可能按 +
     """
+    norm_kw = _norm(keyword)
     headers = page.locator(selectors.EXPANSION_PANEL_HEADER)
     try:
-        n = headers.count()
+        n_headers = headers.count()
     except Exception:
-        n = 0
-    if n == 0:
+        n_headers = 0
+    if n_headers == 0:
         log.debug("  - %r: 沒找到 expansion-panel-header", keyword)
         return False
 
-    norm_kw = _norm(keyword)
-    matched_idx: int | None = None
-    matched_text = ""
+    panels = page.locator(".v-expansion-panel")
+    try:
+        n_panels = panels.count()
+    except Exception:
+        n_panels = 0
+
     print_all = not _EXPANSION_DEBUG_PRINTED["v"]
     if print_all:
-        log.info("  - 發現 %d 個 expansion-panel-header，列出所有 inner_text:", n)
+        log.info("  - 發現 %d 個 expansion panels", n_panels)
 
-    for i in range(n):
-        h = headers.nth(i)
+    for pi in range(n_panels):
+        panel = panels.nth(pi)
+        header = panel.locator(selectors.EXPANSION_PANEL_HEADER).first
+        content = panel.locator(selectors.EXPANSION_PANEL_CONTENT).first
+
         try:
-            text = h.inner_text(timeout=300)
-        except Exception as e:
-            log.debug("    header[%d] inner_text 失敗: %s", i, e)
-            continue
+            header_text = header.inner_text(timeout=200) if header.count() > 0 else ""
+        except Exception:
+            header_text = ""
+
+        # 確保展開（才能讀 content）
+        try:
+            if content.count() > 0 and not content.is_visible(timeout=100):
+                header.click(timeout=1500)
+                content.wait_for(state="visible", timeout=2500)
+        except Exception:
+            pass
+
+        try:
+            content_text = content.inner_text(timeout=200) if content.count() > 0 else ""
+        except Exception:
+            content_text = ""
+
         if print_all:
-            log.info("    header[%d] raw=%r norm=%r", i, text[:80], _norm(text)[:80])
-        if norm_kw and norm_kw in _norm(text):
-            if _is_sold_out(text):
-                log.info("  - %r matched header[%d] %r 但售完，跳過", keyword, i, text[:60])
-                continue
-            matched_idx = i
-            matched_text = text
-            break
+            log.info("    panel[%d] header=%r", pi, header_text[:60])
+            if content_text:
+                log.info("            content=%r", content_text[:120])
+
+        # 模式 A：keyword 命中 header（如 "5880" → "5880 區"）
+        header_match = bool(norm_kw) and norm_kw in _norm(header_text)
+        # 模式 B：keyword 命中 content（如 "搖滾" → "搖滾A區 NT.5,880"）
+        content_match = bool(norm_kw) and norm_kw in _norm(content_text)
+
+        if not header_match and not content_match:
+            continue
+
+        if _is_sold_out(header_text):
+            log.info("  - %r 對應 panel[%d] header 已售完，跳過", keyword, pi)
+            continue
+
+        # 模式 A：header 命中 → 直接在 content 找 + 按鈕（測試場次的 +/- stepper）
+        if header_match and not content_match:
+            log.info("  - %r 命中 header[%d]: %r（試 +/- stepper）", keyword, pi, header_text[:60])
+            if _set_count_via_plus(content, page, count, keyword):
+                log.info("已選擇票區 %s 並設定張數 %d（header 模式）", keyword, count)
+                if print_all:
+                    _EXPANSION_DEBUG_PRINTED["v"] = True
+                return True
+            # 沒有 + button，可能是兩層結構但 content 沒命中 keyword
+            log.info("  - %r header 命中但 content 無 + 按鈕，繼續找下一個", keyword)
+            continue
+
+        # 模式 B：content 命中 → 找含 keyword 的 row/button 並點擊
+        # 正式場次的票區是巢狀 expansion-panel-header（button），點開後才出現 +/- stepper
+        log.info("  - %r 命中 panel[%d] content（試 row 點擊）", keyword, pi)
+        row_selectors = [
+            f"button:has-text('{keyword}')",
+            f".v-expansion-panel-header:has-text('{keyword}')",
+            f".v-list-item:has-text('{keyword}')",
+            f"[role='listitem']:has-text('{keyword}')",
+            f".v-card:has-text('{keyword}')",
+            f"li:has-text('{keyword}')",
+            f"tr:has-text('{keyword}')",
+        ]
+        clicked_row = False
+        clicked_row_text = ""
+        for rsel in row_selectors:
+            try:
+                rows = content.locator(rsel)
+                n_rows = rows.count()
+            except Exception:
+                n_rows = 0
+            for ri in range(n_rows):
+                row = rows.nth(ri)
+                try:
+                    if not row.is_visible(timeout=150):
+                        continue
+                    row_text = row.inner_text(timeout=200)
+                except Exception:
+                    continue
+                if _is_sold_out(row_text):
+                    log.info("    row[%d] %r 已售完，跳過", ri, row_text[:50])
+                    continue
+                try:
+                    row.scroll_into_view_if_needed(timeout=400)
+                    row.click(timeout=1500)
+                    log.info("    已點 row (selector=%s): %r", rsel, row_text[:60])
+                    clicked_row = True
+                    clicked_row_text = row_text
+                    break
+                except Exception as e:
+                    log.debug("    row.click 失敗: %s", e)
+                    continue
+            if clicked_row:
+                break
+
+        if not clicked_row:
+            log.warning("  - %r content 內找不到可點的 row", keyword)
+            continue
+
+        # row 點下後等 stepper / 子 panel 展開
+        page.wait_for_timeout(400)
+
+        # 找 +/- stepper：先試新出現的 +/-，找不到再放寬到整頁
+        # 巢狀 expansion panel 展開後，+/- 通常在剛剛點的 button 下方的 panel-content 內
+        stepper_scope = None
+        # 嘗試找剛剛點到的那個 v-expansion-panel 的 content
+        try:
+            clicked_panel = content.locator(
+                f".v-expansion-panel:has({selectors.EXPANSION_PANEL_HEADER.split(',')[0]}:has-text('{keyword}'))"
+            ).first
+            if clicked_panel.count() > 0:
+                stepper_scope = clicked_panel.locator(selectors.EXPANSION_PANEL_CONTENT).first
+        except Exception:
+            pass
+
+        if stepper_scope is None or stepper_scope.count() == 0:
+            stepper_scope = page
+
+        # 嘗試點 + 按鈕 count 次
+        if _set_count_via_plus(stepper_scope, page, count, keyword):
+            log.info("已選擇票區 %s 並按 + %d 次（巢狀 expansion 模式）", keyword, count)
+        else:
+            log.info("已選擇票區 %s（row click 後無 +/- 出現，假設已選好）", keyword)
+        if print_all:
+            _EXPANSION_DEBUG_PRINTED["v"] = True
+        return True
 
     if print_all:
         _EXPANSION_DEBUG_PRINTED["v"] = True
-
-    if matched_idx is None:
-        return False
-
-    log.info("  - %r 命中 header[%d]: %r", keyword, matched_idx, matched_text[:80])
-    header = headers.nth(matched_idx)
-    try:
-        header.scroll_into_view_if_needed(timeout=500)
-    except Exception:
-        pass
-    try:
-        header.click(timeout=1500)
-    except Exception as e:
-        log.warning("  - 點開 header 失敗: %s", e)
-        return False
-
-    # 找展開後的 content（同一個 .v-expansion-panel 容器）
-    # 用 nth-of-type 配對 header idx 到 panel idx
-    panels = page.locator(".v-expansion-panel")
-    panel = panels.nth(matched_idx)
-    content = panel.locator(selectors.EXPANSION_PANEL_CONTENT).first
-    try:
-        content.wait_for(state="visible", timeout=3000)
-    except Exception:
-        log.warning("  - %r expansion content 沒展開（可能 panel 不對位）", keyword)
-        return False
-
-    # 在 content 內找 + 按鈕（多種樣式）
-    plus_btn = content.locator(_PLUS_SELECTOR).first
-    if plus_btn.count() == 0:
-        # fallback: v-btn--fab（FAB 風格按鈕，+ 是 SVG 圖示）
-        plus_candidates = content.locator(".v-btn--fab, button.v-btn")
-        try:
-            n_btn = plus_candidates.count()
-        except Exception:
-            n_btn = 0
-        # FAB 按鈕通常成對出現（- 與 +），取最後一個（+ 通常在右側）
-        if n_btn >= 2:
-            plus_btn = plus_candidates.nth(n_btn - 1)
-        elif n_btn == 1:
-            plus_btn = plus_candidates.first
-        else:
-            log.warning("  - %r content 內找不到 + 按鈕", keyword)
-            return False
-
-    try:
-        for i in range(count):
-            plus_btn.click(timeout=1500)
-            page.wait_for_timeout(60)
-        log.info("已選擇票區 %s 並設定張數 %d（expansion 模式）", keyword, count)
-        return True
-    except Exception as e:
-        log.warning("  - %r 點 + 失敗: %s", keyword, e)
-        return False
+    return False
 
 
 def _try_select_via_direct_row(page: Page, keyword: str, count: int) -> bool:
