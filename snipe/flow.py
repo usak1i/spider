@@ -365,7 +365,8 @@ def _try_select_via_expansion(page: Page, keyword: str, count: int) -> bool:
             continue
 
         # row 點下後等 stepper / 子 panel 展開
-        page.wait_for_timeout(400)
+        # 開賣後 +/- 通常在 100-200ms 內 render，所以這個等待較短才能讓 polling 快
+        page.wait_for_timeout(150)
 
         # 找 +/- stepper：先試新出現的 +/-，找不到再放寬到整頁
         # 巢狀 expansion panel 展開後，+/- 通常在剛剛點的 button 下方的 panel-content 內
@@ -384,13 +385,17 @@ def _try_select_via_expansion(page: Page, keyword: str, count: int) -> bool:
             stepper_scope = page
 
         # 嘗試點 + 按鈕 count 次
+        # 重要：必須真的按到 + 才算成功；若 +/- 沒出現代表這 row 尚未開放/已售完，
+        # 回傳 False 讓上層繼續輪詢或試下一個 keyword。
         if _set_count_via_plus(stepper_scope, page, count, keyword):
             log.info("已選擇票區 %s 並按 + %d 次（巢狀 expansion 模式）", keyword, count)
-        else:
-            log.info("已選擇票區 %s（row click 後無 +/- 出現，假設已選好）", keyword)
+            if print_all:
+                _EXPANSION_DEBUG_PRINTED["v"] = True
+            return True
+        log.info("  - 點 %r 後 +/- 未出現（尚未開賣 / 售完）", keyword)
         if print_all:
             _EXPANSION_DEBUG_PRINTED["v"] = True
-        return True
+        return False
 
     if print_all:
         _EXPANSION_DEBUG_PRINTED["v"] = True
@@ -439,7 +444,7 @@ def _try_select_via_direct_row(page: Page, keyword: str, count: int) -> bool:
     if plus_btn.count() == 0:
         plus_btn = page.locator(_PLUS_SELECTOR).first
     if plus_btn.count() == 0:
-        log.warning("  - %r 找不到 + 按鈕", keyword)
+        log.info("  - %r 找不到 + 按鈕（尚未開賣 / 售完）", keyword)
         return False
 
     try:
@@ -479,6 +484,98 @@ def select_zone_and_set_count(
 
     _screenshot(page, "no-zone-available")
     raise FlowError(f"沒有可用票區，已嘗試: {zone_priority}")
+
+
+_UPDATE_BUTTON_SELECTORS = (
+    "button.float-btn:has-text('更新票數')",
+    "button.v-btn:has-text('更新票數')",
+    "button:has-text('更新票數')",
+    ".v-btn:has-text('更新票數')",
+)
+
+
+def _click_update_button(page: Page) -> bool:
+    """點擊「更新票數」按鈕（軟刷新票券狀態）。回傳是否成功點到。"""
+    # 先試 role API
+    try:
+        btn = page.get_by_role("button", name="更新票數").first
+        if btn.count() > 0 and btn.is_visible(timeout=150):
+            btn.click(timeout=1000, force=True, no_wait_after=True)
+            return True
+    except Exception:
+        pass
+    for sel in _UPDATE_BUTTON_SELECTORS:
+        try:
+            btn = page.locator(sel).first
+            if btn.count() > 0 and btn.is_visible(timeout=150):
+                btn.click(timeout=1000, force=True, no_wait_after=True)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def refresh_with_update_button_until_zone_selected(
+    page: Page,
+    zone_priority: list[str],
+    count: int,
+    max_seconds: float = 300.0,
+    refresh_interval: float = 0.4,
+    expand_after_attempts: int = 8,
+) -> str:
+    """不斷按「更新票數」直到能選到票區。
+
+    策略：每個 cycle 只試最高優先 keyword；連續失敗 expand_after_attempts 次後
+    才額外試下一個 keyword（但第 1 個 keyword 每個 cycle 都會被試到）。
+
+    例：zone_priority = ['搖滾', '藍', '紅', '黃', '紫']
+        cycle 1-8 :  試 [搖滾]
+        cycle 9-16:  試 [搖滾, 藍]
+        cycle 17-24: 試 [搖滾, 藍, 紅]
+        ...
+
+    跟 click_buy_now_until_modal 不同：
+    - 不重整整個頁面，用「更新票數」按鈕做 AJAX 軟更新
+    """
+    log.info("以「更新票數」按鈕輪詢票區（最多 %ds，每 %.1fs 更新；連續失敗 %d 次後擴展優先序）",
+             int(max_seconds), refresh_interval, expand_after_attempts)
+    deadline = time.time() + max_seconds
+    attempt = 0
+    warned_no_button = False
+
+    while time.time() < deadline:
+        attempt += 1
+        # 動態決定本輪要試多少個 keyword
+        active_n = min(
+            1 + (attempt - 1) // expand_after_attempts,
+            len(zone_priority),
+        )
+        active_keywords = zone_priority[:active_n]
+
+        # 試每個 active keyword
+        for keyword in active_keywords:
+            if _try_select_via_expansion(page, keyword, count):
+                log.info("已選到票區 %s (attempt #%d)", keyword, attempt)
+                return keyword
+            if _try_select_via_direct_row(page, keyword, count):
+                log.info("已選到票區 %s (attempt #%d, direct row)", keyword, attempt)
+                return keyword
+
+        if attempt % 10 == 1:
+            log.info("attempt #%d 試 %s 都沒票，繼續按更新票數…",
+                     attempt, active_keywords)
+
+        # 按「更新票數」軟刷
+        if not _click_update_button(page):
+            if not warned_no_button:
+                log.warning("找不到「更新票數」按鈕；繼續嘗試選票區")
+                warned_no_button = True
+        else:
+            warned_no_button = False
+        page.wait_for_timeout(int(refresh_interval * 1000))
+
+    _screenshot(page, "update-button-timeout")
+    raise FlowError(f"輪詢 {attempt} 次仍無可購票區")
 
 
 def choose_allocation(page: Page, allocation: str) -> None:
@@ -1072,37 +1169,44 @@ def click_go_to_payment(page: Page, timeout: float = 8.0) -> None:
     raise FlowError("找不到/無法點擊「前往付款」按鈕")
 
 
-def run(page: Page, prefs: Preferences, event_url: str) -> None:
-    """完整搶票流程。"""
-    goto_event(page, event_url)
+def _post_zone_selection_flow(page: Page, prefs: Preferences) -> None:
+    """選定票區後的共用步驟。
 
-    # Step A: 點立即購買直到票區 modal 出現
-    click_buy_now_until_modal(page, session_keyword=prefs.session_keyword)
-
-    # Step B: 選票區 + 張數 + 選位方式
-    select_zone_and_set_count(page, prefs.zone_priority, prefs.ticket_count)
+    包含：選位方式 → CAPTCHA → 下一步 → 填寫資料 → 同意條款 → 取票/付款 → 前往付款
+    """
     choose_allocation(page, prefs.seat_allocation)
-
-    # Step C: 可能的圖形驗證碼
     wait_for_captcha_if_present(page)
-
-    # Step D: 下一步 → 可能進入「確認選位結果」中間頁，再到填寫資料頁
     click_next(page)
     navigate_to_data_stage(page, timeout=60.0)
-
-    # Step F: 填寫參加者資訊（若實名制）
     fill_participants(page, prefs.participants)
-
-    # Step G: 勾同意條款
     tick_agreement(page)
     click_next(page)
     wait_for_next_stage(page, r"取票方式|付款方式", "付款結帳頁")
-
-    # Step H: 付款結帳頁 — 取票方式 + 付款方式
     select_pickup(page, prefs.pickup)
     select_payment(page, prefs.payment)
-
-    # Step I: 前往付款（使用者接手 3D 驗證）
     click_go_to_payment(page)
     _screenshot(page, "submitted")
     log.info("已送出訂單，請於瀏覽器完成 3D 驗證")
+
+
+def run(page: Page, prefs: Preferences, event_url: str) -> None:
+    """從活動頁出發的完整搶票流程（點立即購買 → 票區 → ...）。"""
+    goto_event(page, event_url)
+    click_buy_now_until_modal(page, session_keyword=prefs.session_keyword)
+    select_zone_and_set_count(page, prefs.zone_priority, prefs.ticket_count)
+    _post_zone_selection_flow(page, prefs)
+
+
+def run_from_order_page(page: Page, prefs: Preferences, event_url: str) -> None:
+    """從訂購頁 (/order/...) 出發的搶票流程：用「更新票數」按鈕軟刷新。
+
+    跟 run() 不同：
+    - URL 預期是 /order/<event>/<session>（已經跳過立即購買那步）
+    - 用 refresh_with_update_button_until_zone_selected 而非 click_buy_now_until_modal
+    """
+    goto_event(page, event_url)
+    page.wait_for_timeout(1500)  # 給 SPA 初步載入
+    refresh_with_update_button_until_zone_selected(
+        page, prefs.zone_priority, prefs.ticket_count
+    )
+    _post_zone_selection_flow(page, prefs)
